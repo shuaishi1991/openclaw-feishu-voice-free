@@ -60,7 +60,7 @@ source venv/bin/activate
 # 启动 Whisper ASR 服务（端口 8001）
 nohup python scripts/server/whisper-server.py --port 8001 > /tmp/whisper-server.log 2>&1 &
 
-# 启动 Qwen3-TTS 服务（端口 8000，使用 OpenAI 兼容 API）
+# 启动 Qwen3-TTS 服务（端口 8000，使用 OpenAI 兼容 API；可按需追加 --default-instructions）
 nohup python scripts/server/tts-base-server-openai.py --port 8000 --clone voice_embedings/huopo_kexin.pt > /tmp/tts-server.log 2>&1 &
 
 deactivate
@@ -90,11 +90,13 @@ openclaw-feishu-voice-free/
 ├── voice_embedings/                   # 存放克隆好的音色文件（.pt 格式）
 └── scripts/
     ├── server/
-    │   ├── whisper-server.py          # Whisper ASR HTTP 服务（端口 8001）
-    │   ├── tts-base-server.py         # Qwen3-TTS HTTP 服务（自定义 API）
-    │   └── tts-base-server-openai.py   # Qwen3-TTS HTTP 服务（OpenAI 兼容 API，推荐）
+    │   ├── whisper-server.py                  # Whisper ASR HTTP 服务（端口 8001）
+    │   ├── tts-base-server.py                 # Qwen3-TTS HTTP 服务（自定义 API）
+    │   ├── tts-base-server-openai.py          # Qwen3-TTS（OpenAI 兼容 API，推荐）
+    │   └── tts-base-ah-en-server-openai.py    # Qwen3-TTS（关键词插片 + OpenAI 兼容 API，可选）
     └── tools/
-        └── tts-base.py                 # 音色克隆工具（独立测试和克隆音色）
+        ├── tts-base.py                        # 音色克隆与合成 CLI
+        └── tts-base-ah-en.py                  # 关键词插片合成 CLI（与 ah-en 服务端逻辑一致）
 ```
 
 ## 📦 安装
@@ -247,25 +249,26 @@ yum install ffmpeg
 {
   "messages": {
     "tts": {
-      "auto": "always",
+      "auto": "inbound",
       "provider": "openai",
       "timeoutMs": 120000,
       "openai": {
         "apiKey": "no need",
         "baseUrl": "http://localhost:8000/v1",
-        "model": "Qwen3-TTS-12Hz-1.7B-Base",
-        "voice": "huopo_kexin"
+        "model": "Qwen3-TTS-12Hz-1.7B-Base"
       }
     }
   }
 }
 ```
 
-**注意：** 
+**注意：**
 
-- `baseUrl` 指向本地 TTS 服务（使用 `tts-base-server-openai.py`）
-- `voice` 参数会被忽略（实际使用启动服务时指定的 `--clone` 音色文件）
-- `apiKey` 可以设置为任意值（本地服务不需要）
+- `auto`：本仓库示例为 **`inbound`**（仅当用户**先发送语音**时，回复才自动 TTS；纯文字对话不附带语音）。若希望每条文字回复都合成语音，改为 **`always`**（亦可用会话命令 `/tts always` 等，见 [OpenClaw TTS 文档](https://docs.openclaw.ai/tts)）
+- `baseUrl` 指向本地 TTS 服务（使用 `tts-base-server-openai.py` 时一般为 `http://localhost:8000/v1`）
+- 音色由启动 TTS 服务时的 **`--clone`** 指定；本仓库提供的 OpenAI 兼容服务端**不读取**请求体或配置里的 `voice` 字段（若 OpenClaw 仍发送该字段会被忽略）
+- `apiKey` 可填任意非空字符串（本地服务不校验）
+- 合成风格（`instruct`）：请求 JSON 里可带 `instructions`；若省略或为空，服务端使用启动参数 **`--default-instructions`**，其默认值为 **「口语化私人对话口吻」**
 
 ### 服务配置
 
@@ -312,6 +315,7 @@ python scripts/server/tts-base-server-openai.py \
 - `--port`: 服务端口（默认 8000）
 - `--model`: 模型路径或 HuggingFace repo ID（默认 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`）
 - `--clone`: 音色克隆文件路径（可选，支持相对路径）
+- `--default-instructions`: 当 HTTP 请求 JSON **未提供**或 **`instructions` 为空字符串**时，作为 Qwen3-TTS 的 `instruct` 使用；默认 **`口语化私人对话口吻`**
 
 **音色文件路径：**
 
@@ -324,6 +328,58 @@ python scripts/server/tts-base-server-openai.py \
 - `POST /v1/audio/speech` - 生成语音（兼容 OpenAI TTS API）
 - `GET /v1/models` - 获取模型列表
 - `GET /` - 健康检查
+
+**`POST /v1/audio/speech` 请求体（与脚本内文档一致）：**
+
+| 字段 | 说明 |
+|------|------|
+| `input` | 必填，待合成文本（服务端会做括号/表情清理） |
+| `model` | 可选，会被忽略，以本地加载的模型为准 |
+| `instructions` | 可选；省略或空串时使用 `--default-instructions`（默认「口语化私人对话口吻」） |
+| `response_format` | 可选，默认 `mp3` |
+| `speed` | 可选，当前不生效（保留字段） |
+
+语言（`Chinese` / `English`）由服务端根据 **`input` 全文** 自动检测，与脚本实现一致。
+
+**`POST /v1/audio/speech` 响应头（本仓库实现）：**
+
+| 响应头 | 说明 |
+|--------|------|
+| `X-Audio-Duration-Ms` | 合成音频时长（**毫秒**）。飞书 `im.file.create` 上传语音时常需 `duration`；OpenClaw 飞书扩展若在上传时未传该字段，客户端可能不显示总时长（见下文「飞书里收到的机器人语音消息不显示总时长？」）。 |
+
+#### Qwen3-TTS 服务（关键词插片版，可选）
+
+与 `scripts/tools/tts-base-ah-en.py` 相同逻辑：文本中与 **`--keyword`** 匹配的片段替换为预置音频，其余片段走 TTS，并对关键词段做 RMS 音量匹配。仍提供 **`POST /v1/audio/speech`**，适合需要固定语气词素材的场景。
+
+**不要与标准 OpenAI 兼容服务共用同一端口**；示例使用 **8002**。
+
+不传 **`--keyword`** 时，服务端使用内置默认（与 `tts-base-ah-en-server-openai.py` 内 `_DEFAULT_KEYWORD_SPECS` 一致）：`啊...` / `嗯...` 对应 `voice_embedings/ah-en/` 下的 Rainnight 插片 MP3（槽位数 12 / 3），路径为 OpenClaw skills 下的绝对路径；**仓库内开发时**若默认路径下没有这些文件，启动会报错，需自备音频或显式传入 **`--keyword`**。
+
+最简启动（沿用内置关键词插片）：
+
+```bash
+cd /root/.openclaw/skills/openclaw-feishu-voice-free
+source venv/bin/activate
+
+python scripts/server/tts-base-ah-en-server-openai.py \
+  --port 8002 \
+  --model /root/.openclaw/models/Qwen3-TTS/Qwen3-TTS-12Hz-1.7B-Base \
+  --clone voice_embedings/huopo_kexin.pt
+```
+
+自定义插片（覆盖默认，格式与 `scripts/tools/tts-base-ah-en.py` 一致）：
+
+```bash
+python scripts/server/tts-base-ah-en-server-openai.py \
+  --port 8002 \
+  --clone voice_embedings/huopo_kexin.pt \
+  --keyword "啊..." /path/to/ahs.mp3 15 \
+  --keyword "嗯..." /path/to/ens.mp3 3
+```
+
+- **`--keyword`**：可重复；**省略时使用内置默认**；传入则完全按你指定的短语、音频路径、槽位个数加载
+- 同样支持 **`--default-instructions`**，语义与 `tts-base-server-openai.py` 一致（默认「口语化私人对话口吻」）
+- 若用此服务，请在 `openclaw.json` 的 `messages.tts.openai.baseUrl` 中改为对应端口，例如 `http://localhost:8002/v1`
 
 #### Qwen3-TTS 服务（自定义 API，可选）
 
@@ -389,7 +445,7 @@ source venv/bin/activate
 # 启动 Whisper ASR 服务（端口 8001）
 nohup python scripts/server/whisper-server.py --port 8001 > /tmp/whisper-server.log 2>&1 &
 
-# 启动 Qwen3-TTS 服务（端口 8000，OpenAI 兼容 API）
+# 启动 Qwen3-TTS 服务（端口 8000，OpenAI 兼容 API；未传 instructions 时默认「口语化私人对话口吻」，见 --default-instructions）
 nohup python scripts/server/tts-base-server-openai.py --port 8000 --clone voice_embedings/huopo_kexin.pt > /tmp/tts-server.log 2>&1 &
 
 deactivate
@@ -439,10 +495,15 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen3-TTS-12Hz-1.7B-Base",
-    "input": "你好，欢迎使用 Qwen3-TTS",
-    "voice": "alloy"
+    "input": "你好，欢迎使用 Qwen3-TTS"
   }' \
   --output output.mp3
+
+# 可选：覆盖服务端默认 instruct
+# -d '{"model":"Qwen3-TTS-12Hz-1.7B-Base","input":"你好","instructions":"轻松随意"}'
+
+# 查看响应头中的时长（毫秒）：X-Audio-Duration-Ms
+# curl -sS -D - -o /tmp/out.mp3 -X POST ... | grep -i x-audio-duration
 ```
 
 ### 使用 systemd 管理服务（推荐生产环境）
@@ -493,6 +554,8 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
+可在 `ExecStart` 末尾追加 `--default-instructions "你的默认风格"`；省略时与代码内置默认「口语化私人对话口吻」一致。
+
 #### 启用并启动服务
 
 ```bash
@@ -518,19 +581,22 @@ sudo systemctl status openclaw-feishu-voice-free-whisper openclaw-feishu-voice-f
    ↓
 5. OpenClaw 调用 LLM（如 GPT、Claude 等）生成文字回复
    ↓
-6. OpenClaw 通过 messages.tts 配置调用 TTS 服务（OpenAI 兼容 API）
+6. OpenClaw 根据 `messages.tts.auto` 决定是否调用 TTS（示例为 `inbound`：本轮用户发过语音才合成；若为 `always` 则更多场景会走 TTS）
    POST http://localhost:8000/v1/audio/speech
    ↓
-7. TTS 服务合成语音（自动清理括号内容和表情符号），返回 MP3 文件
+7. TTS 服务合成语音（自动清理括号内容和表情符号；未传 `instructions` 时使用服务端默认「口语化私人对话口吻」），返回 MP3 文件
    ↓
 8. OpenClaw 发送语音消息给飞书用户
 ```
+
+（若配置为 `inbound` 而用户只发文字，步骤 6～8 通常跳过，仅发送文字回复。）
 
 ### 架构设计
 
 - **OpenClaw**: 负责消息接收、LLM 调用、文件 IO、与飞书客户端通信
 - **whisper-server**: 常驻内存的 Whisper 模型，提供 ASR 服务（HTTP API）
 - **tts-base-server-openai**: 常驻内存的 Qwen3-TTS 模型，提供 TTS 服务（兼容 OpenAI API）
+- **tts-base-ah-en-server-openai**（可选）: 同上，并支持关键词片段替换为预置音频（需单独端口；`--keyword` 可省略以使用内置默认，或自定义）
 - **飞书客户端**: 用户发送语音消息，接收语音回复
 
 ### 文本清理
@@ -630,12 +696,27 @@ tail -f /root/.openclaw/logs/openclaw.log
 
 **A:** 确保：
 
-1. `messages.tts.auto: "always"` 已设置
+1. `messages.tts.auto` 符合预期：本仓库示例为 **`inbound`**，只有用户**先发语音**后机器人回复才会带语音；若你发的是纯文字却期待语音回复，请改为 **`always`** 或使用 `/tts always`。若已设为 `always` 仍无声，再查下列项
 2. `messages.tts.provider: "openai"` 已设置（使用 OpenAI 兼容 API）
 3. `messages.tts.openai.baseUrl: "http://localhost:8000/v1"` 已设置
 4. TTS 服务在运行（端口 8000）
 5. 检查服务健康状态：`curl http://localhost:8000/`
 6. 检查服务日志：`tail -f /tmp/tts-server.log`
+7. 若使用 **`tts-base-ah-en-server-openai.py`**（非 8000 端口），请把 `messages.tts.openai.baseUrl` 改成对应地址（例如 `http://localhost:8002/v1`）
+
+### Q: 飞书里收到的机器人语音消息不显示总时长？
+
+**A:** 通常**不是**本技能 TTS 生成的文件「没有时长信息」，而是 **OpenClaw 往飞书上传音频时未带上 `duration`（毫秒）**：
+
+- 飞书开放平台在上传文件接口中支持音频 **`duration`**；OpenClaw 扩展 [`extensions/feishu/src/media.ts`](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/media.ts) 里 `uploadFileFeishu` 虽支持 `duration` 参数，但 `sendMediaFeishu` 调用上传时**当前未传入**，容易导致客户端语音条不显示总时长。
+- 本仓库的 **`tts-base-server-openai.py`** 与 **`tts-base-ah-en-server-openai.py`** 已在 TTS 的 HTTP 响应中增加 **`X-Audio-Duration-Ms`**，数值与合成音频一致，便于网关或飞书扩展在下载 TTS 后写入上传请求的 `duration`。若你使用的 OpenClaw 版本尚未读取该响应头，需要**升级 OpenClaw**或向 [openclaw/openclaw](https://github.com/openclaw/openclaw) 提 issue/PR。
+- 自测 TTS 是否返回时长：
+
+```bash
+curl -sS -D - -o /dev/null -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"x","input":"测试"}' | grep -i x-audio-duration
+```
 
 ### Q: 如何更换音色？
 
@@ -686,6 +767,8 @@ netstat -tulpn | grep -E "(8000|8001)"
 # 检查进程
 ps aux | grep -E "(whisper-server|tts-base-server)"
 ```
+
+若使用关键词插片服务，进程名中会出现 `tts-base-ah-en-server-openai`。
 
 1. **检查服务日志**
 

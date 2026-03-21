@@ -4,21 +4,22 @@ Qwen-TTS 服务端 - 兼容 OpenAI TTS API 接口
 提供与 OpenAI /v1/audio/speech 兼容的接口，内部使用 Qwen3-TTS 模型
 
 Usage:
-  python scripts/tts-base-server-openai.py --port 8000 [--model /path/to/model] [--clone /path/to/clone.pt]
+  python scripts/tts-base-server-openai.py --port 8000 [--model /path/to/model] [--clone /path/to/clone.pt] \\
+    [--default-instructions TEXT]
 
 API (兼容 OpenAI):
   POST /v1/audio/speech
   {
     "model": "gpt-4o-mini-tts",  // 可选，会被忽略（使用本地 Qwen3-TTS）
     "input": "Text to generate",
-    "voice": "alloy",            // 可选，映射到不同的音色
-    "instructions": "speak in a cheerful tone",  // 可选，作为 instruct 参数
+    "instructions": "自定义风格",  // 可选；省略或空字符串时使用服务端 --default-instructions（默认：口语化私人对话口吻）
     "response_format": "mp3",     // 可选，默认 mp3
     "speed": 1.0                  // 可选，暂不支持（Qwen3-TTS 不支持）
   }
 
 Response:
   返回音频文件（MP3 格式），Content-Type: audio/mpeg
+  响应头 X-Audio-Duration-Ms: 音频时长（毫秒），供上游（如飞书上传）填写 duration 使用
 
 健康检查:
   GET /v1/models
@@ -45,26 +46,14 @@ model = None
 ref_dict = None
 device = None
 
-# OpenAI voice 到 Qwen3-TTS 的映射（可以根据需要调整）
-VOICE_MAP = {
-    "alloy": "default",
-    "ash": "default",
-    "ballad": "default",
-    "coral": "default",
-    "echo": "default",
-    "fable": "default",
-    "onyx": "default",
-    "nova": "default",
-    "sage": "default",
-    "shimmer": "default",
-    "verse": "default",
-    "marin": "default",
-    "cedar": "default",
-}
+# 请求体未提供 instructions 时的默认 instruct（可用 --default-instructions 覆盖）
+DEFAULT_INSTRUCTIONS = "口语化私人对话口吻"
 
 
 class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
     """兼容 OpenAI TTS API 的请求处理器"""
+
+    default_instructions = DEFAULT_INSTRUCTIONS
 
     def log_message(self, format, *args):
         """重写日志方法，使用 stderr"""
@@ -132,9 +121,10 @@ class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
             print(f'[TTS] Warning: Text is empty after cleaning, using original text', file=sys.stderr)
             text = original_text
 
-        # 可选参数
-        voice = data.get('voice', 'alloy')
-        instructions = data.get('instructions')
+        # 可选参数（缺省或空串用服务端 default_instructions）
+        instructions = data.get("instructions")
+        if instructions is None or (isinstance(instructions, str) and not instructions.strip()):
+            instructions = self.default_instructions
         response_format = data.get('response_format', 'mp3')
         speed = data.get('speed', 1.0)  # 暂不支持，保留用于未来扩展
 
@@ -165,12 +155,13 @@ class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
             print(f'[TTS] Generated in {end - start:.2f}s: "{text[:50]}{"..." if len(text) > 50 else ""}"', file=sys.stderr)
 
             # 转换为请求的格式
-            audio_data = self.convert_audio_format(wavs[0], sr, response_format)
+            audio_data, duration_ms = self.convert_audio_format(wavs[0], sr, response_format)
 
             # 发送响应（捕获 BrokenPipeError，客户端可能已断开）
             try:
                 self.send_response(200)
                 self.send_header('Content-Type', self.get_content_type(response_format))
+                self.send_header('X-Audio-Duration-Ms', str(duration_ms))
                 self.send_header('Content-Length', str(len(audio_data)))
                 self.end_headers()
                 self.wfile.write(audio_data)
@@ -219,8 +210,10 @@ class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
 
     def clean_text(self, text):
         """
-        清理文本：去掉括号包裹的内心描述、场景描述和表情符号
+        清理文本：去掉括号包裹的内心描述、场景描述和常用脸型 Emoji
         示例: "(看向窗外) 你好😊 (微笑)" → "你好"
+        全角与中括号: "（微笑）【提示】［注］好的" → "好的"
+        仅剥黄脸/经典表情等脸型码位；心形、动物、旗帜等非脸型符号不剥除。
         """
         import re
         # 去掉所有 (...) 圆括号内容
@@ -229,39 +222,28 @@ class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
         cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)
         # 去掉所有 {...} 花括号内容
         cleaned = re.sub(r'\{[^}]*\}', '', cleaned)
-        
-        # 去掉表情符号（Emoji）
-        # 匹配常见的 Emoji Unicode 范围
+        # 去掉全角圆括号（…）内容
+        cleaned = re.sub(r'（[^）]*）', '', cleaned)
+        # 去掉中式方括号【…】内容
+        cleaned = re.sub(r'【[^】]*】', '', cleaned)
+        # 去掉全角方括号［…］内容
+        cleaned = re.sub(r'［[^］]*］', '', cleaned)
+
+        # 仅去掉常用脸型 Emoji（不误伤汉字；心形/物体/旗等不在此列）
         emoji_pattern = re.compile(
             "["
-            "\U0001F600-\U0001F64F"  # 表情符号
-            "\U0001F300-\U0001F5FF"  # 符号和象形文字
-            "\U0001F680-\U0001F6FF"  # 交通和地图符号
-            "\U0001F1E0-\U0001F1FF"  # 旗帜（iOS）
-            "\U00002702-\U000027B0"  # 其他符号
-            "\U000024C2-\U0001F251"  # 封闭字符
-            "\U0001F900-\U0001F9FF"  # 补充符号和象形文字
-            "\U0001FA00-\U0001FA6F"  # 扩展符号
-            "\U0001FA70-\U0001FAFF"  # 扩展符号
-            "\U00002600-\U000026FF"  # 杂项符号
-            "\U00002700-\U000027BF"  # 装饰符号
-            "\U0001F018-\U0001F270"  # 各种符号
-            "\U0001F300-\U0001F5FF"  # 符号和象形文字
-            "\U0001F600-\U0001F64F"  # 表情符号
-            "\U0001F680-\U0001F6FF"  # 交通和地图符号
-            "\U0001F700-\U0001F77F"  # 炼金术符号
-            "\U0001F780-\U0001F7FF"  # 几何形状扩展
-            "\U0001F800-\U0001F8FF"  # 补充箭头-C
-            "\U0001F900-\U0001F9FF"  # 补充符号和象形文字
-            "\U0001FA00-\U0001FA6F"  # 扩展符号
-            "\U0001FA70-\U0001FAFF"  # 扩展符号
-            "\U00002600-\U000026FF"  # 杂项符号
-            "\U00002700-\U000027BF"  # 装饰符号
+            "\u2639-\u263a"  # BMP 经典表情 ☹ ☺
+            "\U0001F600-\U0001F64F"  # Emoji 表情主块
+            "\U0001F910-\U0001F92F"  # 补充表情（捂脸、拉链嘴等）
+            "\U0001F970-\U0001F97A"  # 常见新表情（如 🥰 🥺）
+            "\U0000FE0F"  # 变体选择符-16（常与 Emoji 连用）
             "]+",
             flags=re.UNICODE
         )
         cleaned = emoji_pattern.sub('', cleaned)
-        
+        # Emoji 序列拆完后常见的零宽/控制残留（不误删 CJK 标点）
+        cleaned = re.sub(r'[\u200B-\u200D\uFEFF]+', '', cleaned)
+
         # 去掉多余空格和换行
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned if cleaned else text
@@ -275,7 +257,7 @@ class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
         return "English"
 
     def convert_audio_format(self, audio_data, sample_rate, format):
-        """转换音频格式"""
+        """转换音频格式，返回 (bytes, duration_ms)。duration_ms 与 pydub 段长度一致。"""
         # 创建临时 WAV 文件
         temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         temp_wav.close()
@@ -286,32 +268,33 @@ class OpenAICompatibleTTSHandler(BaseHTTPRequestHandler):
 
             # 根据格式转换
             audio = AudioSegment.from_wav(temp_wav.name)
+            duration_ms = len(audio)
 
             if format == "mp3":
                 output = io.BytesIO()
                 audio.export(output, format="mp3")
-                return output.getvalue()
+                return output.getvalue(), duration_ms
             elif format == "wav":
                 output = io.BytesIO()
                 audio.export(output, format="wav")
-                return output.getvalue()
+                return output.getvalue(), duration_ms
             elif format == "opus":
                 output = io.BytesIO()
                 audio.export(output, format="opus")
-                return output.getvalue()
+                return output.getvalue(), duration_ms
             elif format == "aac":
                 output = io.BytesIO()
                 audio.export(output, format="aac")
-                return output.getvalue()
+                return output.getvalue(), duration_ms
             elif format == "flac":
                 output = io.BytesIO()
                 audio.export(output, format="flac")
-                return output.getvalue()
+                return output.getvalue(), duration_ms
             else:
                 # 默认返回 MP3
                 output = io.BytesIO()
                 audio.export(output, format="mp3")
-                return output.getvalue()
+                return output.getvalue(), duration_ms
         finally:
             # 清理临时文件
             try:
@@ -384,7 +367,14 @@ def main():
         default="/root/.openclaw/workspace/skills/openclaw-feishu-voice-free/voice_embedings/huopo_kexin.pt",
         help="Path to cloned voice embedding file (.pt format). If not specified, uses default voice."
     )
+    parser.add_argument(
+        "--default-instructions",
+        default=DEFAULT_INSTRUCTIONS,
+        help="当请求 JSON 未提供或为空字符串 instructions 时，作为 instruct 传入模型（默认：口语化私人对话口吻）",
+    )
     args = parser.parse_args()
+
+    OpenAICompatibleTTSHandler.default_instructions = args.default_instructions
 
     global model, ref_dict, device
 
@@ -462,7 +452,7 @@ def main():
     print(f"   Example request:", file=sys.stderr)
     print(f"""   curl -X POST http://localhost:{args.port}/v1/audio/speech \\
      -H "Content-Type: application/json" \\
-     -d '{{"model": "gpt-4o-mini-tts", "input": "Hello, world!", "voice": "alloy"}}' \\
+     -d '{{"model": "gpt-4o-mini-tts", "input": "Hello, world!"}}' \\
      --output output.mp3""", file=sys.stderr)
 
     try:
