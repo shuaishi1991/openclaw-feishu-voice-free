@@ -92,11 +92,9 @@ openclaw-feishu-voice-free/
     ├── server/
     │   ├── whisper-server.py                  # Whisper ASR HTTP 服务（端口 8001）
     │   ├── tts-base-server.py                 # Qwen3-TTS HTTP 服务（自定义 API）
-    │   ├── tts-base-server-openai.py          # Qwen3-TTS（OpenAI 兼容 API，推荐）
-    │   └── tts-base-ah-en-server-openai.py    # Qwen3-TTS（关键词插片 + OpenAI 兼容 API，可选）
+    │   └── tts-base-server-openai.py          # Qwen3-TTS（OpenAI 兼容 API，推荐）
     └── tools/
-        ├── tts-base.py                        # 音色克隆与合成 CLI
-        └── tts-base-ah-en.py                  # 关键词插片合成 CLI（与 ah-en 服务端逻辑一致）
+        └── tts-base.py                  # 音色克隆与合成 CLI
 ```
 
 ## 📦 安装
@@ -347,40 +345,6 @@ python scripts/server/tts-base-server-openai.py \
 |--------|------|
 | `X-Audio-Duration-Ms` | 合成音频时长（**毫秒**）。飞书 `im.file.create` 上传语音时常需 `duration`；OpenClaw 飞书扩展若在上传时未传该字段，客户端可能不显示总时长（见下文「飞书里收到的机器人语音消息不显示总时长？」）。 |
 
-#### Qwen3-TTS 服务（关键词插片版，可选）
-
-与 `scripts/tools/tts-base-ah-en.py` 相同逻辑：文本中与 **`--keyword`** 匹配的片段替换为预置音频，其余片段走 TTS，并对关键词段做 RMS 音量匹配。仍提供 **`POST /v1/audio/speech`**，适合需要固定语气词素材的场景。
-
-**不要与标准 OpenAI 兼容服务共用同一端口**；示例使用 **8002**。
-
-不传 **`--keyword`** 时，服务端使用内置默认（与 `tts-base-ah-en-server-openai.py` 内 `_DEFAULT_KEYWORD_SPECS` 一致）：`啊...` / `嗯...` 对应 `voice_embedings/ah-en/` 下的 Rainnight 插片 MP3（槽位数 12 / 3），路径为 OpenClaw skills 下的绝对路径；**仓库内开发时**若默认路径下没有这些文件，启动会报错，需自备音频或显式传入 **`--keyword`**。
-
-最简启动（沿用内置关键词插片）：
-
-```bash
-cd /root/.openclaw/skills/openclaw-feishu-voice-free
-source venv/bin/activate
-
-python scripts/server/tts-base-ah-en-server-openai.py \
-  --port 8002 \
-  --model /root/.openclaw/models/Qwen3-TTS/Qwen3-TTS-12Hz-1.7B-Base \
-  --clone voice_embedings/huopo_kexin.pt
-```
-
-自定义插片（覆盖默认，格式与 `scripts/tools/tts-base-ah-en.py` 一致）：
-
-```bash
-python scripts/server/tts-base-ah-en-server-openai.py \
-  --port 8002 \
-  --clone voice_embedings/huopo_kexin.pt \
-  --keyword "啊..." /path/to/ahs.mp3 15 \
-  --keyword "嗯..." /path/to/ens.mp3 3
-```
-
-- **`--keyword`**：可重复；**省略时使用内置默认**；传入则完全按你指定的短语、音频路径、槽位个数加载
-- 同样支持 **`--default-instructions`**，语义与 `tts-base-server-openai.py` 一致（默认「口语化私人对话口吻」）
-- 若用此服务，请在 `openclaw.json` 的 `messages.tts.openai.baseUrl` 中改为对应端口，例如 `http://localhost:8002/v1`
-
 #### Qwen3-TTS 服务（自定义 API，可选）
 
 如果需要使用自定义 API 格式，可以使用 `tts-base-server.py`：
@@ -596,7 +560,6 @@ sudo systemctl status openclaw-feishu-voice-free-whisper openclaw-feishu-voice-f
 - **OpenClaw**: 负责消息接收、LLM 调用、文件 IO、与飞书客户端通信
 - **whisper-server**: 常驻内存的 Whisper 模型，提供 ASR 服务（HTTP API）
 - **tts-base-server-openai**: 常驻内存的 Qwen3-TTS 模型，提供 TTS 服务（兼容 OpenAI API）
-- **tts-base-ah-en-server-openai**（可选）: 同上，并支持关键词片段替换为预置音频（需单独端口；`--keyword` 可省略以使用内置默认，或自定义）
 - **飞书客户端**: 用户发送语音消息，接收语音回复
 
 ### 文本清理
@@ -702,14 +665,13 @@ tail -f /root/.openclaw/logs/openclaw.log
 4. TTS 服务在运行（端口 8000）
 5. 检查服务健康状态：`curl http://localhost:8000/`
 6. 检查服务日志：`tail -f /tmp/tts-server.log`
-7. 若使用 **`tts-base-ah-en-server-openai.py`**（非 8000 端口），请把 `messages.tts.openai.baseUrl` 改成对应地址（例如 `http://localhost:8002/v1`）
 
 ### Q: 飞书里收到的机器人语音消息不显示总时长？
 
 **A:** 通常**不是**本技能 TTS 生成的文件「没有时长信息」，而是 **OpenClaw 往飞书上传音频时未带上 `duration`（毫秒）**：
 
 - 飞书开放平台在上传文件接口中支持音频 **`duration`**；OpenClaw 扩展 [`extensions/feishu/src/media.ts`](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/media.ts) 里 `uploadFileFeishu` 虽支持 `duration` 参数，但 `sendMediaFeishu` 调用上传时**当前未传入**，容易导致客户端语音条不显示总时长。
-- 本仓库的 **`tts-base-server-openai.py`** 与 **`tts-base-ah-en-server-openai.py`** 已在 TTS 的 HTTP 响应中增加 **`X-Audio-Duration-Ms`**，数值与合成音频一致，便于网关或飞书扩展在下载 TTS 后写入上传请求的 `duration`。若你使用的 OpenClaw 版本尚未读取该响应头，需要**升级 OpenClaw**或向 [openclaw/openclaw](https://github.com/openclaw/openclaw) 提 issue/PR。
+- 本仓库的 **`tts-base-server-openai.py`** 已在 TTS 的 HTTP 响应中增加 **`X-Audio-Duration-Ms`**，数值与合成音频一致，便于网关或飞书扩展在下载 TTS 后写入上传请求的 `duration`。若你使用的 OpenClaw 版本尚未读取该响应头，需要**升级 OpenClaw**或向 [openclaw/openclaw](https://github.com/openclaw/openclaw) 提 issue/PR。
 - 自测 TTS 是否返回时长：
 
 ```bash
@@ -767,8 +729,6 @@ netstat -tulpn | grep -E "(8000|8001)"
 # 检查进程
 ps aux | grep -E "(whisper-server|tts-base-server)"
 ```
-
-若使用关键词插片服务，进程名中会出现 `tts-base-ah-en-server-openai`。
 
 1. **检查服务日志**
 
